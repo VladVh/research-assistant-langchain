@@ -22,7 +22,7 @@ def web_search(query: str, max_results: int = 5) -> str:
     """
     try:
         results = DDGS().text(query, max_results=max(1, min(max_results, 10)))
-    except Exception as exc:  # network errors, rate limits, no results
+    except Exception as exc:  # network errors, rate limits, etc
         return f"Search failed: {exc}"
     if not results:
         return "No results."

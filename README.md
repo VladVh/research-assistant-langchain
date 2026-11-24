@@ -1,7 +1,7 @@
 # research-assistant-langchain
 
 A LangGraph agent that searches the web, reads pages and writes a short report with citations.
-A critic node checks that every claim has a source and sends the draft back if not. After at most `MAX_REVISIONS` send-backs (default 2), the graph ends and prints a warning if the critic still had objections.
+A critic node checks that every claim has a source and sends the draft back if not. After at most `MAX_REVISIONS` send-backs (default 2), the graph ends and prints a warning if the critic still had objections. The researcher has a budget of `MAX_TOOL_ROUNDS` tool-calling steps per question (default 12); when it runs out, it must write the report from the sources it already has.
 
 ```mermaid
 graph TD

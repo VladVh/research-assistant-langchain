@@ -23,6 +23,15 @@ from .tools import TOOLS
 
 MODEL = os.getenv("RESEARCH_MODEL", "claude-opus-5-5")
 MAX_REVISIONS = int(os.getenv("MAX_REVISIONS", "2"))
+# Max researcher steps that call tools, per question (revisions included).
+# One step can hold several parallel tool calls.
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "12"))
+
+BUDGET_EXHAUSTED = (
+    "Research budget reached: you cannot call any more tools. "
+    "Write the report now using only the sources you already found. "
+    "Drop or clearly qualify any claim you could not source."
+)
 EVIDENCE_CHARS_PER_SOURCE = 3_000
 
 URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
@@ -34,6 +43,7 @@ class ResearchState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     turn_start: int  # index of the current question in `messages`
     revisions: int  # how many times the critic sent the draft back this turn
+    tool_rounds: int  # researcher steps that called tools this turn
     report: str  # last draft / final report for this turn
 
 
@@ -53,7 +63,10 @@ def _llm(effort: str) -> ChatAnthropic:
     )
 
 
-researcher_llm = _llm("high").bind_tools(TOOLS)
+_researcher_base = _llm("high")
+researcher_llm = _researcher_base.bind_tools(TOOLS)
+# Same tools stay declared (the history contains tool calls), but the model may not call them.
+researcher_no_tools_llm = _researcher_base.bind_tools(TOOLS, tool_choice={"type": "none"})
 critic_llm = _llm("medium").with_structured_output(Critique, method="json_schema")
 
 
@@ -62,14 +75,25 @@ critic_llm = _llm("medium").with_structured_output(Critique, method="json_schema
 
 def start(state: ResearchState) -> dict:
     """Mark where the new question begins and reset per-question counters."""
-    return {"turn_start": len(state["messages"]) - 1, "revisions": 0, "report": ""}
+    return {"turn_start": len(state["messages"]) - 1, "revisions": 0, "tool_rounds": 0, "report": ""}
 
 
 def researcher(state: ResearchState) -> dict:
     """Decide the next step: call tools, or write (or revise) the report."""
-    response = researcher_llm.invoke([SystemMessage(RESEARCHER_SYSTEM), *state["messages"]])
-    update: dict = {"messages": [response]}
-    if not response.tool_calls:
+    update: dict = {"messages": []}
+    if state["tool_rounds"] >= MAX_TOOL_ROUNDS:
+        # Budget spent
+        notice = HumanMessage(BUDGET_EXHAUSTED, name="budget")
+        update["messages"].append(notice)
+        llm, history = researcher_no_tools_llm, [*state["messages"], notice]
+    else:
+        llm, history = researcher_llm, state["messages"]
+
+    response = llm.invoke([SystemMessage(RESEARCHER_SYSTEM), *history])
+    update["messages"].append(response)
+    if response.tool_calls:
+        update["tool_rounds"] = state["tool_rounds"] + 1
+    else:
         update["report"] = response.text
     return update
 
@@ -82,7 +106,7 @@ def _normalize(url: str) -> str:
 
 
 def _citation_problems(report: str, seen_urls: set[str]) -> list[str]:
-    """Deterministic checks the critic doesn't need an LLM for."""
+    """Deterministic checks the critic does without any LLM usage"""
     problems = []
     body, _, sources = report.partition("## Sources")
     if not sources:
@@ -126,7 +150,7 @@ def critic(state: ResearchState) -> dict:
     problems += verdict.problems if not verdict.approved else []
 
     if not problems:
-        return {}  # approved: the report stays the last message of the turn
+        return {}  # approved
 
     feedback = "Reviewer feedback - revise the report and fix these problems:\n" + "\n".join(
         f"- {p}" for p in problems

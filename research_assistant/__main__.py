@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
+import sys
 import uuid
 
 from dotenv import load_dotenv
@@ -19,7 +21,22 @@ load_dotenv()
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # noqa: E402
 from langgraph.checkpoint.sqlite import SqliteSaver  # noqa: E402
 
-from .graph import MAX_REVISIONS, build_graph  # noqa: E402
+from .graph import MAX_REVISIONS, MAX_TOOL_ROUNDS, build_graph  # noqa: E402
+
+# Worst case per question: start + (researcher + tools) per tool round
+# + (researcher + critic) per draft. A small margin on top; the budgets in
+# graph.py should always end the run first.
+RECURSION_LIMIT = 1 + 2 * MAX_TOOL_ROUNDS + 2 * (MAX_REVISIONS + 1) + 10
+
+
+def require_api_key() -> None:
+    """Stop before any search or model call if no Anthropic credential is configured.
+    """
+    if os.getenv("ANTHROPIC_API_KEY", "").strip() or os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip():
+        return
+    sys.exit(
+        "error: ANTHROPIC_API_KEY is not set."
+    )
 
 
 def print_update(node: str, update: dict | None) -> None:
@@ -37,6 +54,8 @@ def print_update(node: str, update: dict | None) -> None:
         elif isinstance(msg, ToolMessage):
             first = str(msg.content).splitlines()[0][:100] if msg.content else ""
             print(f"  [tools] {msg.name} -> {first}")
+        elif isinstance(msg, HumanMessage) and msg.name == "budget":
+            print(f"  [researcher] research budget reached ({MAX_TOOL_ROUNDS} tool rounds), writing with what it has")
         elif isinstance(msg, HumanMessage) and msg.name == "critic":
             print(f"  [critic] sent back (revision {update.get('revisions')}):")
             for line in str(msg.content).splitlines()[1:]:
@@ -44,7 +63,7 @@ def print_update(node: str, update: dict | None) -> None:
 
 
 def ask(graph, thread_id: str, question: str) -> None:
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": RECURSION_LIMIT}
     for chunk in graph.stream({"messages": [HumanMessage(question)]}, config, stream_mode="updates"):
         for node, update in chunk.items():
             print_update(node, update)
@@ -68,6 +87,7 @@ def main() -> None:
         print(build_graph().get_graph().draw_mermaid())
         return
 
+    require_api_key()
     thread_id = args.thread or uuid.uuid4().hex[:8]
     with sqlite3.connect(args.db, check_same_thread=False) as conn:
         graph = build_graph(SqliteSaver(conn))
